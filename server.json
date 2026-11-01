@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sepehr071/fipiran-mcp",
+  "title": "Fipiran Funds",
+  "description": "Read-only Fipiran (fipiran.ir) data on Iranian mutual funds and ETFs: NAV, returns, size, managers.",
+  "repository": {
+    "url": "https://github.com/sepehr071/fipiran-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/sepehr071/fipiran-mcp",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "fipiran-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "FIPIRAN_MCP_PROXY",
+          "description": "Optional HTTP proxy URL for the Fipiran requests; system proxy settings are ignored. The site answers Iranian lines only.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
