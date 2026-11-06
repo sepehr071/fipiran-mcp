@@ -1,6 +1,6 @@
 [project]
 name = "fipiran-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial read-only MCP server for Fipiran (fipiran.ir): Iranian mutual funds and ETFs, NAV, returns, size, managers."
 readme = "README.md"
 license = "MIT"
