@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -40,10 +41,10 @@ async def _industries() -> dict[str, str]:
 
 async def _stocks() -> list[dict]:
     """Every listed share with today's trading, joined from the site's instrumentcompare answer."""
-    r = (await fetch("/instrument/instrumentcompare", dict(STOCK_QUERY))).get("items") or [{}]
+    r, names = await asyncio.gather(fetch("/instrument/instrumentcompare", dict(STOCK_QUERY)), _industries())
+    r = r.get("items") or [{}]
     deals = {t["insCode"]: t for t in r[0].get("instrumentTransactions", [])}
     last = max((t["transactionDate"] for t in deals.values()), default="")
-    names = await _industries()
     out = []
     for i in r[0].get("instruments", []):
         t = deals.get(i["insCode"])
@@ -87,22 +88,18 @@ async def _resolve_stock(query: str) -> dict:
 
 @tool("Market overview and indices")
 async def fp_indices(
-    query: Annotated[
-        str | None, Field(description="Part of an index name, Persian, e.g. 'شاخص کل', 'بانک', 'خودرو', 'فلزات'.")
-    ] = None,
+    query: Annotated[str | None, Field(description="Part of index name, Persian, e.g. 'شاخص کل', 'بانک'.")] = None,
     sort_by: Annotated[
         Literal["annual", "six_month", "quarterly", "monthly", "weekly", "daily", "value"],
-        Field(description="Ranking column; returns are percent over that period."),
+        Field(description="Ranking column; returns in percent."),
     ] = "daily",
     limit: Annotated[int, Field(ge=1, le=70, description="Indices to return.")] = 15,
 ) -> dict:
     """Show the Tehran and Farabourse market summary and rank the 65 market and industry indices by return.
 
-    Use for "how is the bourse today", "which industries are up this year", "what is the total index". Each index has an
-    ins_code: pass it to fp_index_history for its daily values. The first block is the market overview.
+    Each index has an ins_code for fp_index_history. The first block is the market overview.
     """
-    markets = await fetch("/index/marketlast")
-    r = await fetch("/index/indexcompare")
+    markets, r = await asyncio.gather(fetch("/index/marketlast"), fetch("/index/indexcompare"))
     q = _norm(query)
     key = {"value": "lastValueDay"}.get(sort_by, f"{sort_by}Efficiency")
     rows = [x for x in r.get("items", []) if (not q or q in _norm(x["title"])) and x.get(key) is not None]
@@ -151,21 +148,16 @@ async def fp_indices(
 
 @tool("Index history")
 async def fp_index_history(
-    ins_code: Annotated[
-        str, Field(description="Index ins_code from fp_indices, e.g. '32097828799138957' (total index).")
-    ],
+    ins_code: Annotated[str, Field(description="ins_code from fp_indices, e.g. '32097828799138957' (total index).")],
     series: Annotated[
         Literal["value", "returns"],
-        Field(
-            description="value: daily close with the day's low and high. returns: the six rolling returns (percent)."
-        ),
+        Field(description="value: daily close, low, high. returns: six rolling returns (percent)."),
     ] = "value",
-    days: Annotated[int, Field(ge=1, le=4000, description="Latest trading days to cover (about 250 per year).")] = 90,
+    days: Annotated[int, Field(ge=1, le=4000, description="Latest trading days (about 250 per year).")] = 90,
 ) -> dict:
     """Get the daily history of one market or industry index, oldest first, at most 60 evenly spaced points.
 
-    Use after fp_indices for "how did the bourse index move this year" or to compare an industry with the fund
-    market. The value series also has the change over the window.
+    Use after fp_indices. The value series also has the change over the window.
     """
     params = {"insCodes" if series == "returns" else "insCode": ins_code.strip(), "showAll": str(days > 360).lower()}
     rows = await fetch(f"/chart/index{'efficiency' if series == 'returns' else 'value'}chart", params)
@@ -195,33 +187,25 @@ async def fp_index_history(
 
 @tool("Search and rank stocks")
 async def fp_stocks(
-    query: Annotated[
-        str | None, Field(description="Part of the ticker or company name, Persian, e.g. 'فولاد'.")
-    ] = None,
+    query: Annotated[str | None, Field(description="Part of ticker or company name, Persian, e.g. 'فولاد'.")] = None,
     industry: Annotated[
         str | None,
-        Field(description="Industry group name or code, e.g. 'بانک', 'خودرو', '27'. fp_industries lists them."),
+        Field(description="Industry name or code, e.g. 'بانک', '27'. fp_industries lists them."),
     ] = None,
     market: Annotated[
         Literal["bourse", "farabourse", "farabourse_base"] | None,
-        Field(
-            description="bourse: Tehran Stock Exchange; farabourse: Iran Farabourse; farabourse_base: its base market."
-        ),
+        Field(description="Tehran Stock Exchange, Iran Farabourse, or Farabourse base market."),
     ] = None,
     sort_by: Annotated[
         StockSort,
-        Field(description="change_pct: today's gain (closing price vs yesterday). value: traded value."),
+        Field(description="change_pct: today's gain. value: traded value."),
     ] = "value",
-    ascending: Annotated[
-        bool, Field(description="True lists the lowest first (biggest losers for change_pct).")
-    ] = False,
+    ascending: Annotated[bool, Field(description="True lists the lowest first.")] = False,
     limit: Annotated[int, Field(ge=1, le=50, description="Rows to return.")] = 15,
 ) -> dict:
     """Search and rank listed shares traded on the last trading day: top gainers, losers, most traded, by industry.
 
-    Use for "biggest gainers today", "most traded banks", "find the ticker of X". Each row has ins_code and symbol: pass
-    the symbol to fp_stock for the full quote. Prices are rial, value is billion Toman. Shares that did not trade are
-    left out.
+    Pass a row's symbol to fp_stock. Prices are rial, value is billion Toman. Untraded shares are left out.
     """
     rows = await _stocks()
     q, ind = _norm(query), _norm(industry)
@@ -245,15 +229,14 @@ async def fp_stocks(
 
 @tool("Stock quote")
 async def fp_stock(
-    symbol: Annotated[str, Field(description="Ticker, Persian, e.g. 'فولاد', or the ins_code from fp_stocks.")],
+    symbol: Annotated[str, Field(description="Ticker, Persian (e.g. 'فولاد'), or ins_code.")],
     history_days: Annotated[
-        int, Field(ge=0, le=250, description="Also return this many latest trading days of OHLC rows (0 for none).")
+        int, Field(ge=0, le=250, description="Latest trading days of OHLC rows to add (0 none).")
     ] = 0,
 ) -> dict:
     """Get one listed share in full: last trade, range, order book, buyers and sellers, period returns, industry.
 
-    Use after fp_stocks or when the user names a ticker. Prices are rial. The 5-level order book and the retail vs
-    institutional counts are the last published ones. Set history_days for daily OHLC rows (newest first).
+    Prices are rial. Order book and retail vs institutional counts are the last published. history_days adds OHLC rows, newest first.
     """
     base = await _resolve_stock(symbol)
     code = base["ins_code"]
@@ -307,14 +290,13 @@ async def fp_stock(
 @tool("Industry trading")
 async def fp_industries(
     sort_by: Annotated[
-        Literal["value", "volume", "trades"], Field(description="value: traded value; volume: shares; trades: count.")
+        Literal["value", "volume", "trades"], Field(description="value, volume or trade count.")
     ] = "value",
     limit: Annotated[int, Field(ge=1, le=60, description="Industries to return.")] = 20,
 ) -> dict:
     """Rank the stock-market industries by trading on the last day: traded value, volume, number of trades.
 
-    Use for "which industries had the most money flowing today". Use the industry name in fp_stocks(industry=...) to see
-    its shares, or fp_indices(query=...) for its index and returns.
+    Use the name in fp_stocks(industry=...) for its shares, or fp_indices(query=...) for its index.
     """
     rows = await fetch("/chart/industrychart")
     key = {"value": "transactionValue", "volume": "numberOfVolume", "trades": "numberOfTransactions"}[sort_by]

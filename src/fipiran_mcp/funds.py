@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 from typing import Annotated, Any, Literal
 
@@ -111,39 +112,36 @@ async def _find(reg_no: str, group_id: int | None) -> dict:
 @tool("Search and rank funds")
 async def fp_search_funds(
     query: Annotated[
-        str | None, Field(description="Part of the fund name, ticker or manager, Persian (e.g. 'کیان', 'طلا', 'آگاه').")
+        str | None, Field(description="Part of fund name, ticker or manager, Persian (e.g. 'کیان').")
     ] = None,
     fund_type: Annotated[
         str | None,
         Field(
-            description="Type id or name: 4 fixed income (درآمد ثابت), 5 gold/commodity, 6 equity (سهام), 7 mixed (مختلط), 21 sector, 22 leveraged, 23 index, 25 pension... English words work too: fixed_income, gold, equity, mixed. fp_fund_types lists all."
+            description="Type id or name: 4 fixed_income, 5 gold, 6 equity, 7 mixed, 21 sector, 22 leveraged, 23 index, 25 pension. fp_fund_types lists all."
         ),
     ] = None,
     exchange_traded: Annotated[
         bool | None,
-        Field(
-            description="True: only funds traded on the exchange like shares (ETFs, with a ticker). False: only funds you buy and redeem at NAV. Omit for both."
-        ),
+        Field(description="True: only exchange-traded funds (ETFs). False: only NAV-priced funds. Omit for both."),
     ] = None,
-    manager: Annotated[str | None, Field(description="Part of the fund manager's name, e.g. 'آگاه'.")] = None,
+    manager: Annotated[str | None, Field(description="Part of manager name, e.g. 'آگاه'.")] = None,
     min_size_bn_toman: Annotated[
         float | None, Field(description="Only funds at least this big, in billion Toman.")
     ] = None,
     min_age_years: Annotated[
         float | None,
-        Field(description="Only funds older than this; use it so 'annual' returns are not from a young fund."),
+        Field(description="Only funds older than this (years)."),
     ] = None,
-    sort_by: Annotated[SortBy, Field(description="Ranking column; returns are percent over that period.")] = "annual",
+    sort_by: Annotated[SortBy, Field(description="Ranking column; returns in percent.")] = "annual",
     ascending: Annotated[bool, Field(description="True lists the lowest first.")] = False,
     include_market_makers: Annotated[
-        bool, Field(description="Also list market-maker funds (type 11, over 1000 series, rarely wanted).")
+        bool, Field(description="Also list market-maker funds (type 11, 1000+ series).")
     ] = False,
     limit: Annotated[int, Field(ge=1, le=50, description="Rows to return.")] = 15,
 ) -> dict:
     """Search Iranian mutual funds and ETFs by name, type or manager, and rank them by return or size.
 
-    Use for "best fixed income funds this year", "biggest gold funds", "funds managed by X". Each row has reg_no and
-    group_id: pass them to fp_fund, fp_history or fp_compare. Returns are percent; size is billion Toman.
+    Rows have reg_no and group_id for fp_fund, fp_history, fp_compare.
     """
     types = await _types()
     ftype = await _resolve_type(fund_type, types)
@@ -169,17 +167,20 @@ async def fp_search_funds(
     field = SORTS[sort_by]
     have = [x for x in out if (_size(x) if field == "netAsset" else x.get(field)) is not None]
     have.sort(key=lambda x: _size(x) if field == "netAsset" else x[field], reverse=not ascending)
-    return {"matched": len(out), "sorted_by": sort_by, "funds": [_row(x, types) for x in have[:limit]]}
+    funds = [_row(x, types) for x in have[:limit]]
+    data_date = funds[0]["data_date"] if funds else None
+    for f in funds:
+        f.pop("data_date")  # same day for every row
+    return {"matched": len(out), "sorted_by": sort_by, "data_date": data_date, "funds": funds}
 
 
 @tool("Fund types and averages")
 async def fp_fund_types() -> dict:
     """List fund types (equity, fixed income, gold, mixed...) with fund counts, total size and average returns.
 
-    Use first to learn the type ids for fp_search_funds, or for "how are equity funds doing vs fixed income".
-    Returns are the average percent for the type; allocation is the average share of stock/bond/cash/deposit.
+    Gives the type ids for fp_search_funds. Returns are average percent; allocation is the average stock/bond/cash/deposit share.
     """
-    types, avgs, funds = await _types(), await fetch("/fund/averagereturns"), await _funds()
+    types, avgs, funds = await asyncio.gather(_types(), fetch("/fund/averagereturns"), _funds())
     count: dict[int, int] = {}
     for x in funds:
         count[x["fundType"]] = count.get(x["fundType"], 0) + 1
@@ -206,17 +207,17 @@ async def fp_fund_types() -> dict:
 
 @tool("Fund details")
 async def fp_fund(
-    reg_no: Annotated[str, Field(description="Fund registration number from fp_search_funds, e.g. '12288'.")],
+    reg_no: Annotated[str, Field(description="Fund reg_no from fp_search_funds, e.g. '12288'.")],
     group_id: Annotated[
-        int | None, Field(description="Series number from the search row; leave empty for the fund's first series.")
+        int | None, Field(description="Series number from the search row; empty = first series.")
     ] = None,
-    on_date: Annotated[str | None, Field(description="YYYY-MM-DD to see the fund as of an earlier day.")] = None,
+    on_date: Annotated[str | None, Field(description="YYYY-MM-DD: fund as of an earlier day.")] = None,
 ) -> dict:
     """Get one fund in full: NAV, returns, size, allocation, investors, manager, auditor, custodian, website.
 
-    Use after fp_search_funds. For a price series use fp_history; to put several side by side use fp_compare.
+    Use after fp_search_funds. Price series: fp_history.
     """
-    base = await _find(reg_no, group_id)
+    base, types = await asyncio.gather(_find(reg_no, group_id), _types())
     params: dict[str, Any] = {"regno": base["regNo"], "groupId": base["groupId"]}
     if on_date:
         params["date"] = on_date
@@ -224,7 +225,6 @@ async def fp_fund(
     x = r.get("item")
     if not x:
         raise ApiError(f"Fipiran has no data for fund {reg_no} on {on_date or 'the latest day'}.")
-    types = await _types()
     out = _row(x, types)
     out.update({
         "symbol": base.get("smallSymbolName"),  # getfund omits it
@@ -259,24 +259,21 @@ def _thin(rows: list[dict]) -> list[dict]:
 
 @tool("Fund history")
 async def fp_history(
-    reg_no: Annotated[str, Field(description="Fund registration number from fp_search_funds.")],
+    reg_no: Annotated[str, Field(description="Fund reg_no from fp_search_funds.")],
     series: Annotated[
         Literal["nav", "returns", "size", "investors", "dividends"],
         Field(
-            description="nav: price per unit (issue/redeem/statistical NAV, rial). returns: the six rolling returns (percent). size: net assets (billion Toman) and units issued/redeemed per day (flows). investors: share of units held by institutions and by retail investors (percent). dividends: payouts per unit (rial), all of them."
+            description="nav: issue/redeem/statistical NAV per unit (rial). returns: six rolling returns (percent). size: net assets (billion Toman) and daily units issued/redeemed. investors: institutional vs retail unit share (percent). dividends: all payouts per unit (rial)."
         ),
     ] = "nav",
-    days: Annotated[
-        int, Field(ge=1, le=4000, description="How many latest trading days to cover (about 250 per year).")
-    ] = 90,
+    days: Annotated[int, Field(ge=1, le=4000, description="Latest trading days (about 250 per year).")] = 90,
     group_id: Annotated[
-        int | None, Field(description="Series number from the search row; leave empty for the first series.")
+        int | None, Field(description="Series number from the search row; empty = first series.")
     ] = None,
 ) -> dict:
     """Get a fund's daily history: NAV, returns, size and flows, investor mix or dividends, at most 60 points.
 
-    Use for "how did this fund move in the last 6 months" or "are investors putting money in". Oldest first. The
-    result also has the NAV change over the window (nav) or the net units issued minus redeemed (size).
+    Oldest first. Also gives NAV change over the window (nav) or net units issued minus redeemed (size).
     """
     base = await _find(reg_no, group_id)
     path = {
@@ -344,20 +341,22 @@ async def fp_compare(
         Field(
             min_length=2,
             max_length=8,
-            description="2 to 8 funds as 'regNo' or 'regNo-groupId', e.g. ['12288-1', '11695'].",
+            description="'regNo' or 'regNo-groupId', e.g. ['12288-1', '11695'].",
         ),
     ],
 ) -> dict:
     """Put 2 to 8 funds side by side: type, size, NAV, returns for every period, allocation, manager.
 
-    Use after fp_search_funds when the user is choosing between funds. Ids are the reg_no (and group_id) of search rows.
+    Ids are reg_no (and group_id) of search rows.
     """
-    types = await _types()
+    parts = [f.strip().partition("-") for f in funds]
+    types, *found = await asyncio.gather(
+        _types(), *(_find(reg, int(grp) if grp.isdigit() else None) for reg, _, grp in parts)
+    )
     out = []
-    for f in funds:
-        reg, _, grp = f.strip().partition("-")
-        x = await _find(reg, int(grp) if grp.isdigit() else None)
+    for x in found:
         row = _row(x, types)
+        row.pop("data_date")
         row["allocation_pct"] = {k: x.get(k) for k in ("stock", "bond", "cash", "deposit", "other")}
         row["dividend_every_months"] = x.get("dividendIntervalPeriod") or None
         out.append(row)
@@ -366,13 +365,12 @@ async def fp_compare(
 
 @tool("Fund managers")
 async def fp_managers(
-    query: Annotated[str | None, Field(description="Part of a manager's name to filter, e.g. 'کارگزاری'.")] = None,
+    query: Annotated[str | None, Field(description="Part of manager name, e.g. 'کارگزاری'.")] = None,
     limit: Annotated[int, Field(ge=1, le=40, description="Managers to return.")] = 15,
 ) -> dict:
     """Rank fund management companies by total assets under management, with their fund count and typical return.
 
-    Use for "which companies run the most funds". Pass a manager name from here to fp_search_funds(manager=...).
-    avg_annual_return_pct only covers that manager's funds older than one year.
+    Pass a manager name to fp_search_funds(manager=...). avg_annual_return_pct covers only funds older than one year.
     """
     year_ago = (datetime.now() - timedelta(days=365)).date().isoformat()
     groups: dict[str, list[dict]] = {}
